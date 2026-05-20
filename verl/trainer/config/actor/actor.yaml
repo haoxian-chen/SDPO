@@ -92,8 +92,14 @@ self_distillation:
   # Whether to add a tail bucket when using distillation_topk
   distillation_add_tail: True
 
-  # KL interpolation coefficient: 0.0=forward KL, 1.0=reverse KL, in-between=JSD
-  alpha: 0.5 
+  # KL interpolation coefficient for the full-logit path: 0.0=forward KL, 1.0=reverse KL, in-between=JSD
+  # Ignored on the sampled-token path (full_logit_distillation=False); use divergence_type there.
+  alpha: 0.5
+
+  # f-divergence used on the sampled-token path (full_logit_distillation=False).
+  # One of: reverse_kl, forward_kl, jsd, improved_forward_kl, improved_jsd.
+  # Default "reverse_kl" preserves prior behavior bit-exactly. Ignored when full_logit_distillation=True.
+  divergence_type: reverse_kl
 
   # Minimum sequence reward to be considered successful
   success_reward_threshold: 0.5

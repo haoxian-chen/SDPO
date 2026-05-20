@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -33,6 +34,7 @@ from verl.trainer.config import AlgoConfig
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
+from verl.workers.config.actor import DIVERGENCE_TYPES
 
 PolicyLossFn = Callable[
     [
@@ -1082,6 +1084,44 @@ def agg_loss(
     return loss
 
 
+def _compute_neg_g_u(log_u: torch.Tensor, divergence_type: str) -> torch.Tensor:
+    """Per-token -g(u) for the selected f-divergence, with u = p/q (p=teacher, q=student).
+
+    Numerical stability: for variants that need u explicitly, log_u is clamped
+    to [-10, 10] before exp() to keep u in float32 range. reverse_kl and
+    improved_reverse_kl skip the clamp because they only use log_u directly
+    (no exp), preserving bit-exact behavior for reverse_kl.
+
+    Supported divergences:
+      reverse_kl:          g(u) = -ln u                                  -> -g(u) = log_u
+      forward_kl:          g(u) = u ln u                                 -> -g(u) = -u * log_u
+      jsd:                 g(u) = 0.5 [u ln u - (1+u) ln((1+u)/2)]       -> -g(u) = -0.5 * (u*log_u - (u+1)*(log1p(u) - log 2))
+      improved_forward_kl: g(u) = -u                                     -> -g(u) = u
+      improved_reverse_kl: g(u) = -ln u + 1                              -> -g(u) = log_u - 1
+      improved_jsd:        g(u) = -0.5 ln((1+u)/2)                       -> -g(u) = 0.5 * (log1p(u) - log 2)
+    """
+    if divergence_type == "reverse_kl":
+        return log_u
+    if divergence_type == "improved_reverse_kl":
+        return log_u - 1.0
+
+    log_u_clamped = torch.clamp(log_u, min=-10.0, max=10.0)
+    u = torch.exp(log_u_clamped)
+    log2 = math.log(2.0)
+
+    if divergence_type == "forward_kl":
+        return -u * log_u_clamped
+    if divergence_type == "jsd":
+        return -0.5 * (u * log_u_clamped - (u + 1.0) * (torch.log1p(u) - log2))
+    if divergence_type == "improved_forward_kl":
+        return u
+    if divergence_type == "improved_jsd":
+        return 0.5 * (torch.log1p(u) - log2)
+    raise ValueError(
+        f"Unknown divergence_type: {divergence_type!r}. Must be one of {DIVERGENCE_TYPES}."
+    )
+
+
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1097,7 +1137,7 @@ def compute_self_distillation_loss(
     rollout_is_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
-    metrics = {}
+    metrics: dict[str, Any] = {}
 
     loss_mask = response_mask
     if self_distillation_mask is not None:
@@ -1161,9 +1201,29 @@ def compute_self_distillation_loss(
 
         per_token_loss = kl_loss.sum(-1)
     else:
-        assert self_distillation_config.alpha == 1.0, "Only reverse KL is supported for non-full-logit distillation"
-        log_ratio = student_log_probs - teacher_log_probs
-        per_token_loss = log_ratio.detach() * student_log_probs
+        divergence_type = getattr(self_distillation_config, "divergence_type", "reverse_kl")
+        if divergence_type not in DIVERGENCE_TYPES:
+            raise ValueError(
+                f"self_distillation.divergence_type must be one of {DIVERGENCE_TYPES}, "
+                f"got {divergence_type!r}"
+            )
+        # u = p/q with p = teacher and q = student. log_u = log p - log q.
+        # For divergence_type='reverse_kl' this matches the prior implementation
+        # bit-exactly: per_token_loss = (student_log_probs - teacher_log_probs).detach() * student_log_probs.
+        log_u = teacher_log_probs - student_log_probs
+        neg_g_u = _compute_neg_g_u(log_u, divergence_type)
+        per_token_loss = (-neg_g_u).detach() * student_log_probs
+
+        with torch.no_grad():
+            mask_sum = loss_mask.sum().clamp(min=1.0)
+            metrics[f"actor/distill_div/{divergence_type}"] = (
+                ((-neg_g_u) * loss_mask).sum() / mask_sum
+            ).item()
+            # Reverse-KL k1 estimator, emitted regardless of divergence_type as a
+            # stable student-vs-teacher gap diagnostic comparable across runs.
+            metrics["actor/distill_teacher_kl"] = (
+                ((-log_u) * loss_mask).sum() / mask_sum
+            ).item()
 
     is_clip = self_distillation_config.is_clip
     if is_clip is not None:

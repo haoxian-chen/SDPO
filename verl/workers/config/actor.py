@@ -26,6 +26,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "DIVERGENCE_TYPES",
     "SelfDistillationConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
@@ -35,6 +36,20 @@ __all__ = [
 ]
 
 
+# Valid values for SelfDistillationConfig.divergence_type. Used on the
+# sampled-token path (full_logit_distillation=False) to choose which
+# f-divergence g(u) is minimized, where u = p/q with p = teacher and
+# q = student probability of the sampled token.
+DIVERGENCE_TYPES = (
+    "reverse_kl",
+    "forward_kl",
+    "jsd",
+    "improved_forward_kl",
+    "improved_reverse_kl",
+    "improved_jsd",
+)
+
+
 @dataclass
 class SelfDistillationConfig(BaseConfig):
     """Configuration for self-distillation loss.
@@ -42,7 +57,14 @@ class SelfDistillationConfig(BaseConfig):
     Args:
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
-        alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
+        alpha (float): KL interpolation coefficient for the full-logit path.
+            0.0=forward KL, 1.0=reverse KL, in-between=Generalized JSD.
+            Ignored on the sampled-token path (full_logit_distillation=False),
+            where `divergence_type` controls behavior instead.
+        divergence_type (str): f-divergence to minimize on the sampled-token path
+            (full_logit_distillation=False). One of `DIVERGENCE_TYPES`. Default
+            "reverse_kl" preserves the prior implementation bit-exactly. Ignored
+            when full_logit_distillation=True.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
         teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
@@ -64,6 +86,7 @@ class SelfDistillationConfig(BaseConfig):
 
     full_logit_distillation: bool = True
     alpha: float = 0.0
+    divergence_type: str = "reverse_kl"
     success_reward_threshold: float = 1.0
     teacher_regularization: str = "ema"
     teacher_update_rate: float = 0.05
@@ -94,6 +117,11 @@ class SelfDistillationConfig(BaseConfig):
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
+        if self.divergence_type not in DIVERGENCE_TYPES:
+            raise ValueError(
+                f"self_distillation.divergence_type must be one of {DIVERGENCE_TYPES}, "
+                f"got {self.divergence_type!r}"
+            )
         valid_teacher_regularization = ["ema", "trust-region"]
         if self.teacher_regularization not in valid_teacher_regularization:
             raise ValueError(

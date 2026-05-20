@@ -14,6 +14,7 @@
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +22,8 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    _compute_neg_g_u,
+    compute_self_distillation_loss,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -29,6 +32,7 @@ from verl.trainer.ppo.core_algos import (
     get_adv_estimator_fn,
     register_adv_est,
 )
+from verl.workers.config.actor import DIVERGENCE_TYPES
 
 
 def mock_test_fn():
@@ -195,6 +199,151 @@ def test_multi_turn_compute_gae_advantage_return():
     assert torch.equal(adv1, adv2), f"{adv1=}, {adv2=}"
     assert torch.equal(ret1, ret2), f"{ret1=}, {ret2=}"
     print(f" [CORRECT] \n\n{adv1=}, \n\n{ret1=}")
+
+
+@pytest.mark.parametrize("divergence_type", DIVERGENCE_TYPES)
+def test_compute_neg_g_u_matches_tinker_formulas(divergence_type: str):
+    """Keep SDPO's sampled-token divergence helper aligned with tinker-cookbook."""
+    log_u = torch.tensor([[-20.0, -1.0, 0.0, 1.0, 20.0]], dtype=torch.float64)
+    actual = _compute_neg_g_u(log_u, divergence_type)
+
+    # reverse_kl and improved_reverse_kl don't use exp() — they read log_u directly.
+    if divergence_type == "reverse_kl":
+        expected = log_u
+    elif divergence_type == "improved_reverse_kl":
+        expected = log_u - 1.0
+    else:
+        log_u_clamped = torch.clamp(log_u, min=-10.0, max=10.0)
+        u = torch.exp(log_u_clamped)
+        log2 = torch.tensor(np.log(2.0), dtype=log_u.dtype)
+        if divergence_type == "forward_kl":
+            expected = -u * log_u_clamped
+        elif divergence_type == "jsd":
+            expected = -0.5 * (u * log_u_clamped - (u + 1.0) * (torch.log1p(u) - log2))
+        elif divergence_type == "improved_forward_kl":
+            expected = u
+        elif divergence_type == "improved_jsd":
+            expected = 0.5 * (torch.log1p(u) - log2)
+        else:
+            raise AssertionError(f"Unhandled divergence_type: {divergence_type}")
+
+    assert torch.allclose(actual, expected)
+
+
+def test_compute_self_distillation_loss_reverse_kl_matches_prior_sampled_loss():
+    student_log_probs = torch.tensor(
+        [[-0.2, -1.3, -2.0], [-0.7, -0.4, -1.1]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    teacher_log_probs = torch.tensor(
+        [[-0.5, -1.0, -1.7], [-0.9, -0.3, -1.4]],
+        dtype=torch.float32,
+    )
+    response_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 1.0]], dtype=torch.float32)
+    cfg = SimpleNamespace(
+        full_logit_distillation=False,
+        alpha=1.0,
+        divergence_type="reverse_kl",
+        is_clip=None,
+    )
+
+    loss, metrics = compute_self_distillation_loss(
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        response_mask=response_mask,
+        self_distillation_config=cfg,
+        loss_agg_mode="token-mean",
+    )
+
+    prior_per_token_loss = (student_log_probs - teacher_log_probs).detach() * student_log_probs
+    expected_loss = (prior_per_token_loss * response_mask).sum() / response_mask.sum()
+    assert torch.equal(loss, expected_loss)
+
+    actual_grad = torch.autograd.grad(loss, student_log_probs, retain_graph=True)[0]
+    expected_grad = torch.autograd.grad(expected_loss, student_log_probs)[0]
+    assert torch.equal(actual_grad, expected_grad)
+
+    expected_teacher_kl = ((student_log_probs - teacher_log_probs) * response_mask).sum() / response_mask.sum()
+    assert metrics.keys() == {"actor/distill_div/reverse_kl", "actor/distill_teacher_kl"}
+    assert metrics["actor/distill_div/reverse_kl"] == pytest.approx(expected_teacher_kl.item())
+    assert metrics["actor/distill_teacher_kl"] == pytest.approx(expected_teacher_kl.item())
+
+
+# At student==teacher (log_u=0, u=1):
+#   reverse_kl, forward_kl, jsd, improved_jsd all have g(1) = 0
+#       -> per-token signal vanishes, loss is 0, metric is 0.
+#   improved_forward_kl uses g(u)=-u, so g(1) = -1, -g(1) = 1
+#       -> per_token_loss = -student_log_probs, metric = -1.
+#   improved_reverse_kl uses g(u)=-ln u + 1, so g(1) = 1, -g(1) = -1
+#       -> per_token_loss =  student_log_probs, metric = 1.
+# These constant offsets do not change the expected gradient (REINFORCE
+# absorbs constant baselines) but they affect the loss-value scale.
+_NEG_G_AT_MATCH = {
+    "reverse_kl": 0.0,
+    "forward_kl": 0.0,
+    "jsd": 0.0,
+    "improved_forward_kl": 1.0,
+    "improved_reverse_kl": -1.0,
+    "improved_jsd": 0.0,
+}
+
+
+@pytest.mark.parametrize("divergence_type", DIVERGENCE_TYPES)
+def test_compute_self_distillation_loss_at_match_and_metrics(divergence_type: str):
+    student_log_probs = torch.tensor(
+        [[-0.2, -1.3, -2.0], [-0.7, -0.4, -1.1]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    teacher_log_probs = student_log_probs.detach().clone()
+    response_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 1.0]], dtype=torch.float32)
+    cfg = SimpleNamespace(
+        full_logit_distillation=False,
+        alpha=0.5,
+        divergence_type=divergence_type,
+        is_clip=None,
+    )
+
+    loss, metrics = compute_self_distillation_loss(
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        response_mask=response_mask,
+        self_distillation_config=cfg,
+        loss_agg_mode="token-mean",
+    )
+
+    neg_g_const = _NEG_G_AT_MATCH[divergence_type]
+    expected_per_token_loss = -neg_g_const * student_log_probs
+    expected_loss = (expected_per_token_loss * response_mask).sum() / response_mask.sum().clamp(min=1.0)
+    # actor/distill_teacher_kl = mean(-log_u) = 0 at student==teacher for all divergences.
+    # The selected divergence metric is mean(g(u)) = -neg_g_const.
+    expected_div_metric = -neg_g_const
+
+    assert loss.shape == ()
+    assert torch.allclose(loss, expected_loss, atol=1e-7)
+    assert metrics.keys() == {f"actor/distill_div/{divergence_type}", "actor/distill_teacher_kl"}
+    assert metrics[f"actor/distill_div/{divergence_type}"] == pytest.approx(expected_div_metric, abs=1e-7)
+    assert metrics["actor/distill_teacher_kl"] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_compute_self_distillation_loss_invalid_divergence_type_raises():
+    cfg = SimpleNamespace(
+        full_logit_distillation=False,
+        alpha=1.0,
+        divergence_type="not_a_divergence",
+        is_clip=None,
+    )
+    log_probs = torch.zeros(1, 2)
+    response_mask = torch.ones(1, 2)
+
+    with pytest.raises(ValueError, match="self_distillation.divergence_type"):
+        compute_self_distillation_loss(
+            student_log_probs=log_probs,
+            teacher_log_probs=log_probs,
+            response_mask=response_mask,
+            self_distillation_config=cfg,
+        )
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:

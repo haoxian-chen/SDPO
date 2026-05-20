@@ -21,7 +21,9 @@ from verl.workers.config import (
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    SelfDistillationConfig,
 )
+from verl.workers.config.actor import DIVERGENCE_TYPES
 
 
 class TestActorConfig(unittest.TestCase):
@@ -74,6 +76,7 @@ class TestActorConfig(unittest.TestCase):
 
         self.assertIsInstance(config, ActorConfig)
         self.assertEqual(config.strategy, "fsdp")
+        self.assertEqual(config.self_distillation.divergence_type, "reverse_kl")
 
     def test_fsdp_actor_config_from_yaml(self):
         """Test creating FSDPActorConfig from YAML file."""
@@ -213,6 +216,16 @@ class TestActorConfig(unittest.TestCase):
             rollout_n=1,
         )
         self.assertIsNotNone(config)  # Should not raise an exception
+
+    def test_self_distillation_divergence_type_validation(self):
+        """Test sampled-token self-distillation divergence validation."""
+        for divergence_type in DIVERGENCE_TYPES:
+            config = SelfDistillationConfig(divergence_type=divergence_type)
+            self.assertEqual(config.divergence_type, divergence_type)
+
+        with self.assertRaises(ValueError) as cm:
+            SelfDistillationConfig(divergence_type="not_a_divergence")
+        self.assertIn("self_distillation.divergence_type", str(cm.exception))
 
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""
