@@ -107,6 +107,13 @@ do_sample: True
 # number of responses (i.e. num sample times). > 1 for grpo
 n: 1
 
+# Base seed for reproducible training-rollout sampling (agent-loop path). When
+# set, each (step, prompt, replica) gets a deterministic per-request seed, so
+# each step samples fresh while two runs with the same sampling_seed and data
+# order see paired sampling noise. null leaves training-rollout sampling
+# unseeded. Validation uses val_kwargs.seed instead.
+sampling_seed: null
+
 # The over_sample_rate parameter controls the early termination threshold for training rollouts,
 # where the system will abort remaining requests when (1 - over_sample_rate) * total_requests completions are reached.
 over_sample_rate: 0
@@ -146,6 +153,12 @@ val_kwargs:
 
   # Whether to sample during training rollout. False uses greedy sampling.
   do_sample: False
+
+  # Base seed for reproducible validation sampling (agent-loop rollout). When
+  # set, each (prompt, replica) gets a deterministic per-request seed so the n
+  # sampled completions stay diverse but are identical across runs and fixed
+  # across training steps. null leaves validation sampling unseeded.
+  seed: null
 
 # Multi-turn interaction config for tools or chat.
 multi_turn:

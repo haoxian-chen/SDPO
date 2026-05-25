@@ -128,7 +128,9 @@ algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONTS_REPROMPT_ON_SELF_SUCCESS} \
 actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
 actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-actor_rollout_ref.rollout.val_kwargs.n=16"
+actor_rollout_ref.rollout.val_kwargs.n=16 \
+actor_rollout_ref.rollout.val_kwargs.seed=42 \
+actor_rollout_ref.rollout.sampling_seed=42"
 
                             run_job "$EXP_NAME" "$ARGS" "$DATA_PATH"
                         done

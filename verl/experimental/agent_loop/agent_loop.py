@@ -432,9 +432,17 @@ class AgentLoopWorker:
         )
 
         # override sampling params for validation
-        if batch.meta_info.get("validate", False):
+        is_validate = batch.meta_info.get("validate", False)
+        if is_validate:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
+
+        # Optional reproducible sampling, applied per-request in the dispatch loop
+        # below. Validation uses val_kwargs.seed and omits the step so eval noise
+        # is held constant across training steps; training uses rollout.sampling_seed
+        # and includes the step so each step samples fresh while two runs with the
+        # same base seed (and data order) see paired noise. None => unseeded.
+        base_sampling_seed = config.val_kwargs.seed if is_validate else config.sampling_seed
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -470,9 +478,30 @@ class AgentLoopWorker:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            task_sampling_params = sampling_params
+            if base_sampling_seed is not None:
+                # Derive a per-request seed so a prompt's n completions differ yet
+                # are reproducible run-to-run. The validation/training sets are
+                # built and sharded deterministically, so (sample_index, rollout_n)
+                # is stable across runs; rollout_n (or the unique per-row index)
+                # keeps a prompt's n repeats distinct. Validation omits the step so
+                # eval noise stays fixed across steps; training includes it so each
+                # step samples fresh while paired runs stay aligned.
+                traj = trajectory_info[i]
+                if is_validate:
+                    derived_seed = _derive_request_seed(
+                        base_sampling_seed, traj["sample_index"], traj["rollout_n"]
+                    )
+                else:
+                    derived_seed = _derive_request_seed(
+                        base_sampling_seed, traj["step"], traj["sample_index"], traj["rollout_n"]
+                    )
+                task_sampling_params = {**sampling_params, "seed": derived_seed}
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_agent_loop(
+                        task_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs
+                    )
                 )
             )
         outputs = await asyncio.gather(*tasks)
@@ -807,6 +836,22 @@ class AgentLoopWorker:
             client_id=f"AgentLoopWorker_{client_name}",
             config=self.config.transfer_queue,
         )
+
+
+def _derive_request_seed(base_seed: int, *components: int) -> int:
+    """Fold a base seed and request identifiers into a per-request sampling seed.
+
+    Returns a value in [0, 2**31). The mapping is deterministic, so two runs that
+    share ``base_seed`` and see the same identifiers (e.g. step / prompt / replica)
+    get paired sampling noise. Because the components are folded in order, distinct
+    trailing components (such as the replica index) guarantee the ``n`` samples of
+    one prompt receive distinct seeds. Cross-prompt seed collisions are harmless:
+    different prompts produce different outputs regardless of the seed.
+    """
+    h = int(base_seed) & 0x7FFFFFFF
+    for c in components:
+        h = (h * 1000003 + int(c)) & 0x7FFFFFFF
+    return h
 
 
 async def get_trajectory_info(step, index, validate):

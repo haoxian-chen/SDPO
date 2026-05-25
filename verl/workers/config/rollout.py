@@ -40,6 +40,12 @@ class SamplingConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+    # Base seed for sampling. Used by the agent-loop rollout to make validation
+    # generation reproducible: when set on `val_kwargs`, each (prompt, replica)
+    # gets a deterministic per-request seed derived from this base, so the `n`
+    # sampled completions stay diverse but are identical across runs and fixed
+    # across training steps. None (default) leaves sampling unseeded.
+    seed: Optional[int] = None
 
 
 @dataclass
@@ -130,6 +136,14 @@ class RolloutConfig(BaseConfig):
     do_sample: bool = True
     n: int = 1
     repetition_penalty: float = 1.0
+
+    # Base seed for training-rollout sampling (agent-loop path). When set, each
+    # request gets a deterministic per-(step, prompt, replica) seed, so each step
+    # samples fresh while two runs with the same sampling_seed and data order see
+    # paired sampling noise (variance reduction for A/B comparisons). None
+    # (default) leaves training-rollout sampling unseeded. Validation uses
+    # `val_kwargs.seed` instead.
+    sampling_seed: Optional[int] = None
 
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.

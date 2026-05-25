@@ -231,6 +231,7 @@ actor_rollout_ref:
     disable_log_stats: true
     do_sample: true
     'n': 1
+    sampling_seed: null
     over_sample_rate: 0
     multi_stage_wake_up: false
     engine_kwargs:
@@ -243,6 +244,7 @@ actor_rollout_ref:
       temperature: 0
       'n': 1
       do_sample: false
+      seed: null
     multi_turn:
       _target_: verl.workers.config.MultiTurnConfig
       enable: false
